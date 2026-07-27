@@ -15,3 +15,5 @@ passes-data
 rewards-data
 .idea
 .pnpm-store
+# Epoch result disk cache (EPOCH_RESULT_DISK_CACHE_DIR default)
+/cache/
