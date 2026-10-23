@@ -1,4 +1,5 @@
 import { ContractMethodNames } from "../../contracts/src/definitions";
+import { Fdc2AttestationRequested } from "../../contracts/src/events/Fdc2AttestationRequested";
 import { DataAvailabilityStatus, DataManager, DataMangerResponse } from "../../ftso-core/src/DataManager";
 import {
   BlockAssuranceResult,
@@ -20,6 +21,7 @@ import { ILogger } from "../../ftso-core/src/utils/ILogger";
 import { asError } from "../../ftso-core/src/utils/error";
 import { Address, MessageHash } from "../../ftso-core/src/voting-types";
 import { IndexerClientForRewarding } from "./IndexerClientForRewarding";
+import { assertRandomProvesRoot } from "./relay-acceptance";
 import {
   ADDITIONAL_REWARDED_FINALIZATION_WINDOWS,
   FDC_PROTOCOL_ID,
@@ -30,6 +32,7 @@ import {
   FDCDataForVotingRound,
   FDCRewardData,
   FastUpdatesDataForVotingRound,
+  FCCDataForVotingRound,
   PartialFDCDataForVotingRound,
 } from "./data-calculation-interfaces";
 import { bitVoteIndicesNum, extractFDCRewardData, uniqueRequestsIndices } from "./reward-calculation/fdc/fdc-utils";
@@ -87,6 +90,13 @@ export class DataManagerForRewarding extends DataManager {
         status: signaturesResponse.status,
       };
     }
+    const finalizations = this.extractFinalizations(
+      votingRoundId,
+      dataForCalculationsResponse.data.rewardEpoch,
+      signaturesResponse.data.finalizations,
+      FTSO2_PROTOCOL_ID
+    );
+    const firstSuccessfulFinalization = finalizations.find((finalization) => finalization.successfulOnChain);
     const signatures = DataManagerForRewarding.extractSignatures(
       votingRoundId,
       dataForCalculationsResponse.data.rewardEpoch,
@@ -95,13 +105,6 @@ export class DataManagerForRewarding extends DataManager {
       undefined,
       this.logger
     );
-    const finalizations = this.extractFinalizations(
-      votingRoundId,
-      dataForCalculationsResponse.data.rewardEpoch,
-      signaturesResponse.data.finalizations,
-      FTSO2_PROTOCOL_ID
-    );
-    const firstSuccessfulFinalization = finalizations.find((finalization) => finalization.successfulOnChain);
     return {
       status: DataAvailabilityStatus.OK,
       data: {
@@ -259,7 +262,9 @@ export class DataManagerForRewarding extends DataManager {
             // - Override the messageHash if provided
             // - Require
 
-            const messageHash = providedMessageHash ?? ProtocolMessageMerkleRoot.hash(signaturePayload.message);
+            const messageHash =
+              providedMessageHash ??
+              ProtocolMessageMerkleRoot.hash(signaturePayload.message, rewardEpoch.sourceChainId);
 
             const signer = ECDSASignature.recoverSigner(messageHash, signaturePayload.signature).toLowerCase();
             // submit signature address should match the signingPolicyAddress
@@ -356,7 +361,12 @@ export class DataManagerForRewarding extends DataManager {
     lastVotingRoundId: number,
     randomGenerationBenchingWindow: number,
     useFastUpdatesData: boolean,
-    useFDCData: boolean
+    useFDCData: boolean,
+    // Which reward epoch to attribute FCC fees to and that epoch's full voting round range, or undefined when FCC
+    // accounting is not active for it. Carrying this rather than a boolean makes it impossible to collect FCC data
+    // without saying which epoch it funded, and the epoch range is what keeps a batched run from counting the same
+    // fee once per batch.
+    fccAttribution?: { rewardEpochId: number; firstVotingRoundId: number; lastVotingRoundId: number }
   ): Promise<DataMangerResponse<DataForRewardCalculation[]>> {
     const dataForCalculationsResponse = await this.getDataForCalculationsForVotingRoundRange(
       firstVotingRoundId,
@@ -379,6 +389,7 @@ export class DataManagerForRewarding extends DataManager {
     }
     let fastUpdatesData: FastUpdatesDataForVotingRound[] = [];
     let partialFdcData: PartialFDCDataForVotingRound[] = [];
+    let fccData: FCCDataForVotingRound[] = [];
 
     if (useFastUpdatesData) {
       const fastUpdatesDataResponse = await this.getFastUpdatesDataForVotingRoundRange(
@@ -400,6 +411,19 @@ export class DataManagerForRewarding extends DataManager {
         };
       }
       partialFdcData = partialFdcDataResponse.data;
+    }
+    if (fccAttribution !== undefined) {
+      const fccDataResponse = await this.getFCCDataForVotingRoundRange(
+        firstVotingRoundId,
+        lastVotingRoundId,
+        fccAttribution
+      );
+      if (fccDataResponse.status !== DataAvailabilityStatus.OK) {
+        return {
+          status: fccDataResponse.status,
+        };
+      }
+      fccData = fccDataResponse.data;
     }
 
     const result: DataForRewardCalculation[] = [];
@@ -449,15 +473,9 @@ export class DataManagerForRewarding extends DataManager {
         FTSO2_PROTOCOL_ID
       );
       const firstSuccessfulFinalization = finalizations.find((finalization) => finalization.successfulOnChain);
-      let signatures: Map<MessageHash, GenericSubmissionData<ISignaturePayload>[]> = new Map<
-        MessageHash,
-        GenericSubmissionData<ISignaturePayload>[]
-      >();
-      if (!firstSuccessfulFinalization) {
-        this.logger.warn(`No successful finalization found for voting round ${votingRoundId}`);
-      }
+      let signatures: Map<MessageHash, GenericSubmissionData<ISignaturePayload>[]>;
       if (firstSuccessfulFinalization) {
-        RelayMessage.augment(firstSuccessfulFinalization.messages);
+        RelayMessage.augment(firstSuccessfulFinalization.messages, rewardEpoch.sourceChainId);
         if (!firstSuccessfulFinalization.messages.protocolMessageHash) {
           throw new Error(
             `Protocol message merkle root is missing for FTSO finalization ${firstSuccessfulFinalization.messages.protocolMessageHash}`
@@ -470,6 +488,19 @@ export class DataManagerForRewarding extends DataManager {
           votingRoundSignatures,
           FTSO2_PROTOCOL_ID,
           consensusMessageHashFTSO,
+          this.logger
+        );
+      } else {
+        // No consensus hash to key on, so the signatures are read under the epoch's own digest, as the
+        // single round path reads them. Leaving the map empty would drop the round's double signing
+        // penalties, which are charged whether or not the round finalized.
+        this.logger.warn(`No successful finalization found for voting round ${votingRoundId}`);
+        signatures = DataManagerForRewarding.extractSignatures(
+          votingRoundId,
+          rewardEpoch,
+          votingRoundSignatures,
+          FTSO2_PROTOCOL_ID,
+          undefined,
           this.logger
         );
       }
@@ -492,7 +523,7 @@ export class DataManagerForRewarding extends DataManager {
               `Protocol message merkle root is missing for FDC finalization ${fdcFirstSuccessfulFinalization.messages.protocolMessageHash}`
             );
           }
-          RelayMessage.augment(fdcFirstSuccessfulFinalization.messages);
+          RelayMessage.augment(fdcFirstSuccessfulFinalization.messages, rewardEpoch.sourceChainId);
           const consensusMessageHash = fdcFirstSuccessfulFinalization.messages.protocolMessageHash;
           fdcSignatures = DataManagerForRewarding.extractSignatures(
             votingRoundId,
@@ -549,6 +580,7 @@ export class DataManagerForRewarding extends DataManager {
         firstSuccessfulFinalization,
         fastUpdatesData: fastUpdatesData[votingRoundId - firstVotingRoundId],
         fdcData,
+        fccData: fccAttribution !== undefined ? fccData[votingRoundId - firstVotingRoundId] : undefined,
       };
       result.push(dataForRound);
     }
@@ -645,12 +677,15 @@ export class DataManagerForRewarding extends DataManager {
             continue;
           }
           // TODO: Check if the signing policy is correct
-          const rewardEpochSigningPolicyHash = SigningPolicy.hash(rewardEpoch.signingPolicy);
-          const relayingSigningPolicyHash = SigningPolicy.hash(relayMessage.signingPolicy);
-          if (rewardEpochSigningPolicyHash !== relayingSigningPolicyHash) {
-            throw new Error(
-              `Signing policy mismatch. Expected hash: ${rewardEpochSigningPolicyHash}, got ${relayingSigningPolicyHash}`
-            );
+          if (!SigningPolicy.equals(rewardEpoch.signingPolicy, relayMessage.signingPolicy)) {
+            throw new Error(`Signing policy mismatch for reward epoch ${rewardEpoch.rewardEpochId}`);
+          }
+          // Only the Relay the epoch is signed against can finalize it. A call to any other Relay verifies
+          // under a different digest and cannot be graded here, however the chain treated it - and a status-1
+          // call to an address with no code succeeds without executing any Relay, so the target, not the
+          // receipt, is what makes a finalization authoritative.
+          if (submission.relayAddress.toLowerCase() !== rewardEpoch.relayAddress.toLowerCase()) {
+            continue;
           }
           const finalization: ParsedFinalizationData = {
             ...submission,
@@ -658,7 +693,16 @@ export class DataManagerForRewarding extends DataManager {
           };
           // Verify the relay message by trying to encode it with verification.
           // If it excepts it is non-finalisable
-          RelayMessage.encode(relayMessage, true);
+          const sourceChainId = rewardEpoch.sourceChainId;
+          RelayMessage.encode(relayMessage, true, sourceChainId);
+          // A signed prefix is not enough on Relay v2: it rejects a non-canonical signature encoding
+          // outright, and on the random number generating protocol the call also carries the random number
+          // and its Merkle proof and reverts without a correct one. Grace-period rewards do not require the
+          // call to have succeeded on chain, and a status-1 call to a codeless address never ran the proof
+          // check, so the trailer is re-verified here for every V2 finalization rather than trusting status.
+          if (sourceChainId !== undefined && protocolId === FTSO2_PROTOCOL_ID) {
+            assertRandomProvesRoot(relayMessage);
+          }
           // The message is eligible for consideration.
           finalizations.push(finalization);
         } catch (e) {
@@ -760,7 +804,7 @@ export class DataManagerForRewarding extends DataManager {
         throw new Error(`FastUpdateFeeds is undefined for voting round ${votingRoundId}`);
       }
 
-      if ((fastUpdateFeeds as any) === "MISSING_FAST_UPDATE_FEEDS") {
+      if ((fastUpdateFeeds as unknown as string) === "MISSING_FAST_UPDATE_FEEDS") {
         result.push(undefined);
         this.logger.error(`WARN: FastUpdateFeeds missing for voting round ${votingRoundId}`);
         continue;
@@ -773,6 +817,91 @@ export class DataManagerForRewarding extends DataManager {
         signingPolicyAddressesSubmitted: fastUpdateSubmissions.map((submission) => submission.signingPolicyAddress),
       };
       result.push(value);
+    }
+    return {
+      status: DataAvailabilityStatus.OK,
+      data: result,
+    };
+  }
+
+  /**
+   * Collects the FCC fee events for the voting round range.
+   *
+   * The two sources are disjoint by construction on chain: an FDC2 request paying P credits the configured fee F
+   * through Fdc2Hub (AttestationRequested) and forwards P - F into FlareTeeManager (TeeInstructionsSent), so
+   * summing both yields exactly the funds added to RewardManager, with no double counting.
+   */
+  public async getFCCDataForVotingRoundRange(
+    firstVotingRoundId: number,
+    lastVotingRoundId: number,
+    attribution: { rewardEpochId: number; firstVotingRoundId: number; lastVotingRoundId: number }
+  ): Promise<DataMangerResponse<FCCDataForVotingRound[]>> {
+    const { rewardEpochId } = attribution;
+    // Bounded by the RewardEpochStarted events rather than the voting round schedule, because that is where
+    // getCurrentRewardEpochId() flips and therefore which epoch receiveRewards credited. See the method docs.
+    const window = await this.indexerClient.getRewardEpochFundingWindow(rewardEpochId);
+
+    const teeInstructionsResponse = await this.indexerClient.getTeeInstructionsSentEvents(
+      window,
+      attribution,
+      firstVotingRoundId,
+      lastVotingRoundId
+    );
+    if (teeInstructionsResponse.status !== BlockAssuranceResult.OK) {
+      return {
+        status: DataAvailabilityStatus.NOT_OK,
+      };
+    }
+    const fdc2RequestsResponse = await this.indexerClient.getFdc2AttestationRequestedEvents(
+      window,
+      attribution,
+      firstVotingRoundId,
+      lastVotingRoundId
+    );
+    if (fdc2RequestsResponse.status !== BlockAssuranceResult.OK) {
+      return {
+        status: DataAvailabilityStatus.NOT_OK,
+      };
+    }
+
+    // An FDC2 request carries no reward epoch id of its own. It is always emitted in the same transaction as the
+    // TeeInstructionsSent that shares its instructionId, so that event's reward epoch id is its own. The map is
+    // built over the whole window, before any filtering, so a pair straddling a voting round bucket still resolves.
+    const rewardEpochIdByInstructionId = new Map<string, number>();
+    for (const eventsInRound of teeInstructionsResponse.data) {
+      for (const event of eventsInRound) {
+        rewardEpochIdByInstructionId.set(event.instructionId, event.rewardEpochId);
+      }
+    }
+
+    const result: FCCDataForVotingRound[] = [];
+    for (let votingRoundId = firstVotingRoundId; votingRoundId <= lastVotingRoundId; votingRoundId++) {
+      const index = votingRoundId - firstVotingRoundId;
+      const teeInRound = teeInstructionsResponse.data[index];
+      const fdc2InRound = fdc2RequestsResponse.data[index];
+
+      const teeInstructions = teeInRound.filter((event) => event.rewardEpochId === rewardEpochId);
+      let eventsExcludedByRewardEpochId = teeInRound.length - teeInstructions.length;
+      let unpairedFdc2Requests = 0;
+      const fdc2AttestationRequests: Fdc2AttestationRequested[] = [];
+      for (const event of fdc2InRound) {
+        const pairedRewardEpochId = rewardEpochIdByInstructionId.get(event.instructionId);
+        if (pairedRewardEpochId === undefined) {
+          unpairedFdc2Requests++;
+        } else if (pairedRewardEpochId === rewardEpochId) {
+          fdc2AttestationRequests.push(event);
+        } else {
+          eventsExcludedByRewardEpochId++;
+        }
+      }
+
+      result.push({
+        votingRoundId,
+        teeInstructions,
+        fdc2AttestationRequests,
+        eventsExcludedByRewardEpochId,
+        unpairedFdc2Requests,
+      });
     }
     return {
       status: DataAvailabilityStatus.OK,

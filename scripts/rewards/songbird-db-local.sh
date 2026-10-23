@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Reward calculation for Songbird network
 # Setup the correct DB connection and run the script, e.g.
 # ./scripts/rewards/songbird-db.sh
@@ -10,7 +11,8 @@ export INDEXER_TOP_TIMEOUT=1000
 export DB_HOST=127.0.0.1
 export DB_PORT=3306
 export DB_USERNAME=ftso-indxr-sgb-rdr
-export DB_PASSWORD=$(gcloud secrets versions access latest --project flare-network-production --secret="ftso_v2_c_chain_indexer_sgb_db_reader_password")
+DB_PASSWORD=$(gcloud secrets versions access latest --project flare-network-production --secret="ftso_v2_c_chain_indexer_sgb_db_reader_password")
+export DB_PASSWORD
 export DB_NAME=flare_ftso_indexer_songbird
 
 export REMOVE_ANNOYING_MESSAGES=true
@@ -24,14 +26,11 @@ export REMOVE_ANNOYING_MESSAGES=true
 pnpm nest build ftso-reward-calculation-process
 
 # ---------------------------------------------------------------------------------------------------------------------------
-# Calculating all reward data from the starting reward epoch id. The calculation of claims is parallelized. 
-# In the current (ongoing) reward epoch the calculation is switched to incremental, as data becomes available. 
+# Calculating all reward data from the starting reward epoch id through the latest completed epoch.
+# The calculation of claims is parallelized.
 # If the data for a specific reward epoch id is already available, the calculation is skipped.
 export FROM_REWARD_EPOCH_ID=196
 node dist/apps/ftso-reward-calculation-process/src/main.js ftso-reward-calculation-process -g -o -c -a -y -b 100 -w 10 -d $FROM_REWARD_EPOCH_ID -m 10000
-
-# Incremental calculation
-# node dist/apps/ftso-reward-calculation-process/src/main.js ftso-reward-calculation-process -l -b 80 -w 5 -m 10000
 
 # ---------------------------------------------------------------------------------------------------------------------------
 # Recoverable sequential calculation

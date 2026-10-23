@@ -73,6 +73,9 @@ describe(`ftso-data-provider.service attack scenarios (${getTestFile(__filename)
     db_pass: "",
     db_port: -1,
     api_keys: [],
+    // Round ids repeat across tests, so a shared on-disk cache would leak results between them.
+    epoch_result_disk_cache_size: 0,
+    fdc_result_cache_size: 0,
   };
   const configService = new ConfigService(configValues);
 
@@ -279,7 +282,7 @@ describe(`ftso-data-provider.service attack scenarios (${getTestFile(__filename)
 
     clock.tick(EPOCH_SETTINGS().revealDeadlineSeconds * 1000 + 1);
     await db.syncTimeToNow();
-    return Promise.all(services.map((s) => s.getResultData(round)));
+    return Promise.all(services.map(async (s) => (await s.getResultData(round))?.message));
   }
 
   // ──────────────────────────────────────────────────────────────────

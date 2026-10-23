@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1-od.1] - 2026-10-23
+
+Fork release: upstream 1.2.1 plus the data provider changes below. Builds before upstream 1.2.0 do not read the
+redeployed `Relay`, so on Flare they compute every round from reward epoch 442 (voting round 1485120) on with reward
+epoch 441's voters and weights; this release replaces such results, including any it finds in the disk cache.
+
+### Added
+
+- Opt-in caches of finalized round results: an in-memory LRU (`EPOCH_RESULT_CACHE_SIZE`) and a disk cache that
+  survives restarts (`EPOCH_RESULT_DISK_CACHE_SIZE`, `EPOCH_RESULT_DISK_CACHE_DIR`), with concurrent requests for the
+  same round sharing one computation.
+- `GET /fdcRoundResults/:votingRoundId`: the deduplicated attestation requests of a finalized round and each
+  provider's bitvote, in the Flare explorer's JSON shape, with an opt-in cache (`FDC_RESULT_CACHE_SIZE`).
+- `EPOCH_RESULT_REBUILD_FROM_ROUND`: an opt-in background pass after startup that verifies or recomputes every
+  disk-cached round from that round to the latest finalized one. Set it once to `1485120` after upgrading a Flare
+  provider whose disk cache was written by an older build, and unset it once the log reports the pass complete.
+
+### Fixed
+
+- Disk-cached results are served only if they match the signing policy resolved for their round; others are
+  discarded and recomputed.
+- A round that resolves to a known-stale reward epoch (more than one behind the expected one, or with the next reward
+  epoch's `RewardEpochStarted` already indexed) is neither served nor cached, so results are never computed with the
+  previous signing policy when the indexer lacks a newer one.
+- Responses no longer modify the cached results they contain, which made later merkle tree and proof requests for the
+  round fail.
+- `BigIntInterceptor` no longer fails responses that contain `null` fields.
+
+## [1.2.1] - 2026-10-22
+
+### Security
+
+- TLS connections reject certificates issued under the eight compromised eMudhra (emSign) intermediate CA keys, whichever root they chain to.
+
+## [1.2.0] - 2026-09-07
+
+### Added
+
+- Support for the redeployed `Relay`, which binds the source chain id into every signed digest. Protocol messages
+  and signing policies are hashed as `keccak256(chainId ‖ content)` for the reward epochs served by the new
+  contract, and the legacy hashing is kept for every epoch before it, so historical reward epochs grade exactly as
+  they did. Which contract a reward epoch belongs to is resolved from indexed data rather than configuration:
+  signing policies and finalizations are read from both the old and the new `Relay`, a finalization is graded only
+  against the contract that epoch was signed for, and there is no activation epoch to set
+- The data provider serves the round's random number and its Merkle proof as `finalizationData` on the
+  `submitSignatures` response, which is what the new `Relay` requires appended to the `relay()` calldata of an FTSO
+  finalization. A round without it is still signed and submitted; only that provider's own finalization is lost.
+- FCC (Flare Confidential Compute) fee accounting, activating on Songbird at reward epoch 419 and on Coston and
+  Coston2 at reward epoch 5877. The FCC contracts are configured for every network and the accounting is gated by
+  the activation reward epoch alone; on Flare that epoch is far in the future, so FCC fees are not accounted for
+  there yet. The fees of TEE
+  instruction dispatches (`FlareTeeManager.TeeInstructionsSent`) and FDC2 attestation requests
+  (`Fdc2Hub.AttestationRequested`) are credited to the `RewardManager` when paid; until the TEE rewarding logic
+  exists they are redirected in full to `FCC_FEES_ADDRESS` as a direct reward claim, so that all claims keep
+  summing to the funds available on the `RewardManager`. The two sources are tagged separately and merge into a
+  single direct claim in the final distribution. Unrelated to the legacy FDC fee handling and to the FIP.16
+  FDC→FIRE split, both of which are unchanged.
+  See `docs/migrations/FCC-fee-accounting.md`.
+- A per-reward-epoch FCC reconciliation (`fcc-reconciliation.json`) that fails the calculation if the observed FCC
+  fees are not fully covered by claims, or if an FDC2 request is missing its paired TEE instruction event. It also
+  compares the sum of all claims against `RewardManager.getRewardEpochTotals`, read over the newly configured
+  per-network public RPC (`RPC_URL`, overridable with the `RPC` env var); that comparison spans every reward
+  source and is fatal when available. Coston2 explicitly excludes its exact validator-inflation allocation, derived
+  as the on-chain inflation total minus the required FTSO, Fast Updates, and FDC inflation offers so per-receiver
+  rounding is preserved; no generic residual tolerance is used. If an RPC transport failure prevents the on-chain
+  total from being read, the summary reports that the check was skipped instead of claiming that all checks passed;
+  configuration, ABI, decoding, and contract-call failures remain fatal.
+
+### Changed
+
+- Legacy incremental reward calculation is no longer supported. The `-l` option and direct service entry point now
+  reject the request; reward ranges run only through the latest completed epoch.
+
+### Fixed
+
+- The reward calculation worker closes its Nest application context after each task, instead of leaking one per
+  task.
+- The Docker build no longer misses the pnpm lockfile.
+
 ## [1.1.1] - 2026-07-16
 
 ### Changed
