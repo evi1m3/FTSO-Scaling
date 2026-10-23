@@ -8,12 +8,14 @@ export class BigIntInterceptor implements NestInterceptor {
     return next.handle().pipe(map((data) => this.convertBigIntToString(data)));
   }
 
+  // Builds new arrays and objects rather than assigning into the response: handlers may return objects they keep,
+  // such as cached round results, whose bigint fields later requests still compute with.
   private convertBigIntToString(data: any): any {
+    if (typeof data === "bigint") {
+      return data.toString();
+    }
     // typeof null === "object", but Object.keys(null) throws
     if (data === null || typeof data !== "object") {
-      if (typeof data === "bigint") {
-        data = data.toString();
-      }
       return data;
     }
 
@@ -21,10 +23,15 @@ export class BigIntInterceptor implements NestInterceptor {
       return data.map((item) => this.convertBigIntToString(item));
     }
 
-    Object.keys(data).forEach((key) => {
-      data[key] = this.convertBigIntToString(data[key]);
-    });
+    // serialized by its own toJSON (e.g. Date), not by its fields
+    if (typeof data.toJSON === "function") {
+      return data;
+    }
 
-    return data;
+    const converted: Record<string, any> = {};
+    for (const key of Object.keys(data)) {
+      converted[key] = this.convertBigIntToString(data[key]);
+    }
+    return converted;
   }
 }

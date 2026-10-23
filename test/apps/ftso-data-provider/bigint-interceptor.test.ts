@@ -44,6 +44,15 @@ describe(`BigIntInterceptor (${getTestFile(__filename)})`, () => {
     expect(result).to.deep.equal(payload);
   });
 
+  it("leaves the handler's objects unmodified, since they may be cached", async () => {
+    const cached = { weights: [1n, 2n], data: { participatingWeight: 3n }, when: new Date(0) };
+    const result = await runInterceptor({ medianData: [cached] });
+    expect(result).to.deep.equal({
+      medianData: [{ weights: ["1", "2"], data: { participatingWeight: "3" }, when: new Date(0) }],
+    });
+    expect(cached).to.deep.equal({ weights: [1n, 2n], data: { participatingWeight: 3n }, when: new Date(0) });
+  });
+
   it("handles null and primitives at the top level", async () => {
     expect(await runInterceptor(null)).to.equal(null);
     expect(await runInterceptor(42n)).to.equal("42");
