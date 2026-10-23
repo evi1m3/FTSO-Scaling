@@ -407,7 +407,8 @@ describe(`ftso-data-provider.service (${getTestFile(__filename)})`, () => {
       try {
         const restarted = new FtsoDataProviderService(emptyDb.em, diskCacheConfig(10));
         const restoredResult = await restarted.getResultData(votingRound);
-        expect(restoredResult.merkleRoot).to.be.equal(result.merkleRoot);
+        expect(restoredResult.message.merkleRoot).to.be.equal(result.message.merkleRoot);
+        expect(restoredResult.finalizationData).to.be.equal(result.finalizationData);
 
         // The rebuilt merkle tree must produce valid proofs.
         const medianData = await restarted.getFullMedianData(votingRound);
