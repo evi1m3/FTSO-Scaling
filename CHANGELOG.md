@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1-od.1] - 2026-10-23
+
+Fork release: upstream 1.2.1 plus the data provider changes below. Builds before upstream 1.2.0 do not read the
+redeployed `Relay`, so on Flare they compute every round from reward epoch 442 (voting round 1485120) on with reward
+epoch 441's voters and weights; this release replaces such results, including any it finds in the disk cache.
+
+### Added
+
+- Opt-in caches of finalized round results: an in-memory LRU (`EPOCH_RESULT_CACHE_SIZE`) and a disk cache that
+  survives restarts (`EPOCH_RESULT_DISK_CACHE_SIZE`, `EPOCH_RESULT_DISK_CACHE_DIR`), with concurrent requests for the
+  same round sharing one computation.
+- `GET /fdcRoundResults/:votingRoundId`: the deduplicated attestation requests of a finalized round and each
+  provider's bitvote, in the Flare explorer's JSON shape, with an opt-in cache (`FDC_RESULT_CACHE_SIZE`).
+- `EPOCH_RESULT_REBUILD_FROM_ROUND`: an opt-in background pass after startup that verifies or recomputes every
+  disk-cached round from that round to the latest finalized one. Set it once to `1485120` after upgrading a Flare
+  provider whose disk cache was written by an older build, and unset it once the log reports the pass complete.
+
+### Fixed
+
+- Disk-cached results are served only if they match the signing policy resolved for their round; others are
+  discarded and recomputed.
+- A round that resolves to a known-stale reward epoch (more than one behind the expected one, or with the next reward
+  epoch's `RewardEpochStarted` already indexed) is neither served nor cached, so results are never computed with the
+  previous signing policy when the indexer lacks a newer one.
+- Responses no longer modify the cached results they contain, which made later merkle tree and proof requests for the
+  round fail.
+- `BigIntInterceptor` no longer fails responses that contain `null` fields.
+
 ## [1.2.1] - 2026-10-22
 
 ### Security
