@@ -2,6 +2,7 @@ import { Logger } from "@nestjs/common";
 import * as fs from "fs";
 import * as path from "path";
 import { prepareResultsForVotingRound } from "../../../../libs/ftso-core/src/ftso-calculation/ftso-calculation-logic";
+import { RewardEpoch } from "../../../../libs/ftso-core/src/RewardEpoch";
 import { bigIntReplacer, bigIntReviver } from "../../../../libs/ftso-core/src/utils/big-number-serialization";
 import { errorString } from "../../../../libs/ftso-core/src/utils/error";
 import {
@@ -15,6 +16,42 @@ interface StoredEpochResult {
   votingRoundId: number;
   medianData: MedianCalculationResult[];
   randomData: RandomCalculationResult;
+}
+
+/**
+ * Returns why a cached result was not computed against the given reward epoch's
+ * signing policy, or undefined if it was: same canonical feed order, and every
+ * feed's voters and median weights as the reward epoch defines them.
+ *
+ * A result is only as correct as the reward epoch resolved for its round, and a
+ * build that resolves the wrong one keeps producing well-formed results — e.g. a
+ * build that does not index the redeployed Relay finds no SigningPolicyInitialized
+ * for the new reward epochs and silently computes every later round with the last
+ * signing policy it knows. Entries such a build wrote must not outlive it.
+ */
+export function signingPolicyMismatch(result: EpochResult, rewardEpoch: RewardEpoch): string | undefined {
+  const feedOrder = rewardEpoch.canonicalFeedOrder;
+  if (result.medianData.length !== feedOrder.length) {
+    return `${result.medianData.length} feeds, reward epoch ${rewardEpoch.rewardEpochId} has ${feedOrder.length}`;
+  }
+  const voters = rewardEpoch.orderedVotersSubmitAddresses.map((address) => address.toLowerCase());
+  for (const [index, median] of result.medianData.entries()) {
+    if (median.feed.id !== feedOrder[index].id) {
+      return `feed ${index} is ${median.feed.id}, reward epoch ${rewardEpoch.rewardEpochId} has ${feedOrder[index].id}`;
+    }
+    if (
+      median.votersSubmitAddresses.length !== voters.length ||
+      median.votersSubmitAddresses.some((address, i) => address.toLowerCase() !== voters[i])
+    ) {
+      return `voter set differs from reward epoch ${rewardEpoch.rewardEpochId}`;
+    }
+    for (const [i, voter] of voters.entries()) {
+      if (median.weights[i] !== rewardEpoch.ftsoMedianVotingWeight(voter)) {
+        return `median weight of ${voter} differs from reward epoch ${rewardEpoch.rewardEpochId}`;
+      }
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -46,6 +83,13 @@ export class EpochResultDiskCache {
       const match = /^(\d+)\.json$/.exec(name);
       if (match) {
         this.roundIds.add(parseInt(match[1]));
+      } else if (/^\d+\.json\.tmp$/.test(name)) {
+        // left by a write interrupted before its rename
+        try {
+          fs.unlinkSync(path.join(this.dir, name));
+        } catch (e) {
+          this.logger.warn(`Failed to remove ${name}: ${errorString(e)}`);
+        }
       }
     }
     for (const id of this.excessRoundIds()) {
@@ -57,6 +101,38 @@ export class EpochResultDiskCache {
       }
     }
     this.logger.log(`Epoch result disk cache at ${this.dir}: ${this.roundIds.size}/${this.maxRounds} rounds`);
+  }
+
+  /** Maximum number of rounds kept on disk. */
+  get capacity(): number {
+    return this.maxRounds;
+  }
+
+  has(votingRoundId: number): boolean {
+    return this.roundIds.has(votingRoundId);
+  }
+
+  /** Whether writing this round now would evict it right away: the cache is full and every cached round is newer. */
+  wouldEvict(votingRoundId: number): boolean {
+    if (this.roundIds.has(votingRoundId) || this.roundIds.size < this.maxRounds) {
+      return false;
+    }
+    for (const id of this.roundIds) {
+      if (id < votingRoundId) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Removes a round's entry. Never throws — an entry that cannot be removed is still forgotten by this instance. */
+  async delete(votingRoundId: number): Promise<void> {
+    this.roundIds.delete(votingRoundId);
+    await fs.promises.unlink(this.filePath(votingRoundId)).catch((e: NodeJS.ErrnoException) => {
+      if (e.code !== "ENOENT") {
+        this.logger.warn(`Failed to delete cached result for round ${votingRoundId}: ${errorString(e)}`);
+      }
+    });
   }
 
   async get(votingRoundId: number): Promise<EpochResult | undefined> {
